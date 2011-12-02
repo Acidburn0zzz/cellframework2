@@ -1,9 +1,11 @@
 #include "stream.h"
 #include <cell/audio.h>
 #include <cell/sysmodule.h>
+#include <sys/synchronization.h>
 #include <pthread.h>
 #include <string.h>
 #include <stdlib.h>
+#include <altivec.h>
 
 #include "buffer.h"
 #include "resampler.h"
@@ -21,52 +23,52 @@ static void init_audioport(void)
 
 typedef struct audioport
 {
-   volatile u64 quit_thread;
-   u32 audio_port;
+   volatile uint64_t quit_thread;
+   uint32_t audio_port;
 
-   u32 channels;
+   uint32_t channels;
 
-   pthread_mutex_t lock;
-   pthread_mutex_t cond_lock;
-   pthread_cond_t cond;
+   sys_lwmutex_t lock;
+   sys_lwmutex_t cond_lock;
+   sys_lwcond_t cond;
    pthread_t thread;
 
    resampler_t *re;
    float *re_buffer;
-   s16 *re_pull_buffer;
+   int16_t *re_pull_buffer;
 
    fifo_buffer_t *buffer;
 
    cell_audio_sample_cb_t sample_cb;
    void *userdata;
 
-   u32 is_paused;
+   uint32_t is_paused;
 } audioport_t;
 
-static u32 resampler_cb(void *userdata, float **data)
+static uint32_t resampler_cb(void *userdata, float **data)
 {
    audioport_t *port = userdata;
-   u32 has_read = 0;
+   uint32_t has_read = 0;
 
    if (port->sample_cb)
-      has_read = port->sample_cb(port->re_pull_buffer, CELL_AUDIO_BLOCK_SAMPLES * port->channels * sizeof(s16), port->userdata);
+      has_read = port->sample_cb(port->re_pull_buffer, CELL_AUDIO_BLOCK_SAMPLES * port->channels * sizeof(int16_t), port->userdata);
    else
    {
       has_read = CELL_AUDIO_BLOCK_SAMPLES * port->channels;
-      pthread_mutex_lock(&port->lock);
-      u32 avail = fifo_read_avail(port->buffer);
-      if (avail < CELL_AUDIO_BLOCK_SAMPLES * port->channels * sizeof(s16))
-         has_read = avail / sizeof(s16);
+      sys_lwmutex_lock(&port->lock, SYS_NO_TIMEOUT);
+      uint32_t avail = fifo_read_avail(port->buffer);
+      if (avail < CELL_AUDIO_BLOCK_SAMPLES * port->channels * sizeof(int16_t))
+         has_read = avail / sizeof(int16_t);
 
-      fifo_read(port->buffer, port->re_pull_buffer, has_read * sizeof(s16));
-      pthread_mutex_unlock(&port->lock);
-      pthread_cond_signal(&port->cond);
+      fifo_read(port->buffer, port->re_pull_buffer, has_read * sizeof(int16_t));
+      sys_lwmutex_unlock(&port->lock);
+      sys_lwcond_signal(&port->cond);
    }
 
    if (has_read < CELL_AUDIO_BLOCK_SAMPLES * port->channels * 2)
-      memset(port->re_pull_buffer + has_read, 0, (CELL_AUDIO_BLOCK_SAMPLES * port->channels - has_read) * sizeof(s16));
+      memset(port->re_pull_buffer + has_read, 0, (CELL_AUDIO_BLOCK_SAMPLES * port->channels - has_read) * sizeof(int16_t));
 
-   resampler_s16_to_float(port->re_buffer, port->re_pull_buffer, CELL_AUDIO_BLOCK_SAMPLES * port->channels);
+   resampler_int16_t_to_float(port->re_buffer, port->re_pull_buffer, CELL_AUDIO_BLOCK_SAMPLES * port->channels);
 
    *data = port->re_buffer;
    return CELL_AUDIO_BLOCK_SAMPLES;
@@ -76,7 +78,7 @@ static void resampler_event_loop(audioport_t *port, sys_event_queue_t id)
 {
    sys_event_t event;
    port->re_buffer = memalign(128, CELL_AUDIO_BLOCK_SAMPLES * port->channels * sizeof(float));
-   port->re_pull_buffer = memalign(128, CELL_AUDIO_BLOCK_SAMPLES * port->channels * sizeof(s16));
+   port->re_pull_buffer = memalign(128, CELL_AUDIO_BLOCK_SAMPLES * port->channels * sizeof(int16_t));
 
    float *res_buffer = memalign(128, CELL_AUDIO_BLOCK_SAMPLES * port->channels * sizeof(float));
 
@@ -97,29 +99,29 @@ static void pull_event_loop(audioport_t *port, sys_event_queue_t id)
 {
    sys_event_t event;
 
-   s16 *in_buf = memalign(128, CELL_AUDIO_BLOCK_SAMPLES * port->channels * sizeof(s16));
+   int16_t *in_buf = memalign(128, CELL_AUDIO_BLOCK_SAMPLES * port->channels * sizeof(int16_t));
    float *conv_buf = memalign(128, CELL_AUDIO_BLOCK_SAMPLES * port->channels * sizeof(float));
    while (!port->quit_thread)
    {
-      u32 has_read = 0;
+      uint32_t has_read = 0;
       if (port->sample_cb)
          has_read = port->sample_cb(in_buf, CELL_AUDIO_BLOCK_SAMPLES * port->channels, port->userdata);
       else
       {
          has_read = CELL_AUDIO_BLOCK_SAMPLES * port->channels;
-         pthread_mutex_lock(&port->lock);
-         u32 avail = fifo_read_avail(port->buffer);
-         if (avail < CELL_AUDIO_BLOCK_SAMPLES * port->channels * sizeof(s16))
-            has_read = avail / sizeof(s16);
+         sys_lwmutex_lock(&port->lock, SYS_NO_TIMEOUT);
+         uint32_t avail = fifo_read_avail(port->buffer);
+         if (avail < CELL_AUDIO_BLOCK_SAMPLES * port->channels * sizeof(int16_t))
+            has_read = avail / sizeof(int16_t);
 
-         fifo_read(port->buffer, in_buf, has_read * sizeof(s16));
-         pthread_mutex_unlock(&port->lock);
+         fifo_read(port->buffer, in_buf, has_read * sizeof(int16_t));
+         sys_lwmutex_unlock(&port->lock);
       }
 
       if (has_read < CELL_AUDIO_BLOCK_SAMPLES * port->channels)
-         memset(in_buf + has_read, 0, (CELL_AUDIO_BLOCK_SAMPLES * port->channels - has_read) * sizeof(s16));
+         memset(in_buf + has_read, 0, (CELL_AUDIO_BLOCK_SAMPLES * port->channels - has_read) * sizeof(int16_t));
 
-      resampler_s16_to_float(conv_buf, in_buf, CELL_AUDIO_BLOCK_SAMPLES * port->channels);
+      resampler_int16_t_to_float(conv_buf, in_buf, CELL_AUDIO_BLOCK_SAMPLES * port->channels);
       sys_event_queue_receive(id, &event, SYS_NO_TIMEOUT);
       cellAudioAddData(port->audio_port, conv_buf, CELL_AUDIO_BLOCK_SAMPLES, 1.0);
 
@@ -171,9 +173,18 @@ static cell_audio_handle_t audioport_init(const struct cell_audio_params *params
       handle->re = resampler_new(resampler_cb, 48000.0 / params->samplerate, params->channels, handle);
    }
 
-   pthread_mutex_init(&handle->lock, NULL);
-   pthread_mutex_init(&handle->cond_lock, NULL);
-   pthread_cond_init(&handle->cond, NULL);
+   sys_lwmutex_attribute_t attr;
+   sys_lwmutex_attribute_t attr2;
+   sys_lwmutex_attribute_t cond_attr;
+
+   sys_lwmutex_attribute_initialize(attr);
+   sys_lwmutex_create(&handle->lock, &attr);
+
+   sys_lwmutex_attribute_initialize(attr2);
+   sys_lwmutex_create(&handle->cond_lock, &attr2);
+
+   sys_lwcond_attribute_initialize(cond_attr);
+   sys_lwcond_create(&handle->cond, &handle->cond_lock, &cond_attr);
 
    cellAudioPortOpen(&port_params, &handle->audio_port);
    cellAudioPortStart(handle->audio_port);
@@ -189,7 +200,7 @@ static void audioport_pause(cell_audio_handle_t handle)
    cellAudioPortStop(port->audio_port);
 }
 
-static s32 audioport_unpause(cell_audio_handle_t handle)
+static int32_t audioport_unpause(cell_audio_handle_t handle)
 {
    audioport_t *port = handle;
    port->is_paused = 0;
@@ -197,7 +208,7 @@ static s32 audioport_unpause(cell_audio_handle_t handle)
    return 0;
 }
 
-static u32 audioport_is_paused(cell_audio_handle_t handle)
+static uint32_t audioport_is_paused(cell_audio_handle_t handle)
 {
    audioport_t *port = handle;
    return port->is_paused;
@@ -210,9 +221,9 @@ static void audioport_free(cell_audio_handle_t handle)
    port->quit_thread = 1;
    pthread_join(port->thread, NULL);
 
-   pthread_mutex_destroy(&port->lock);
-   pthread_mutex_destroy(&port->cond_lock);
-   pthread_cond_destroy(&port->cond);
+   sys_lwmutex_destroy(&port->lock);
+   sys_lwmutex_destroy(&port->cond_lock);
+   sys_lwcond_destroy(&port->cond);
 
    if (port->re)
       resampler_free(port->re);
@@ -225,49 +236,45 @@ static void audioport_free(cell_audio_handle_t handle)
    free(port);
 }
 
-static u32 audioport_write_avail(cell_audio_handle_t handle)
+static uint32_t audioport_write_avail(cell_audio_handle_t handle)
 {
    audioport_t *port = handle;
 
-   pthread_mutex_lock(&port->lock);
-   u32 ret = fifo_write_avail(port->buffer);
-   pthread_mutex_unlock(&port->lock);
-   return ret / sizeof(s16);
+   sys_lwmutex_lock(&port->lock, SYS_NO_TIMEOUT);
+   uint32_t ret = fifo_write_avail(port->buffer);
+   sys_lwmutex_unlock(&port->lock);
+   return ret / sizeof(int16_t);
 }
 
-static s32 audioport_write(cell_audio_handle_t handle, const s16 *data, u32 samples)
+static int32_t audioport_write(cell_audio_handle_t handle, const int16_t *data, uint32_t samples)
 {
-   s32 ret = samples;
-   u32 bytes = samples * sizeof(s16);
+   int32_t ret = samples;
+   uint32_t bytes = samples * sizeof(int16_t);
 
    audioport_t *port = handle;
    while (bytes > 0)
    {
-      pthread_mutex_lock(&port->lock);
-      u32 avail = fifo_write_avail(port->buffer);
-      pthread_mutex_unlock(&port->lock);
+      sys_lwmutex_lock(&port->lock, SYS_NO_TIMEOUT);
+      uint32_t avail = fifo_write_avail(port->buffer);
+      sys_lwmutex_unlock(&port->lock);
 
-      u32 to_write = avail < bytes ? avail : bytes;
+      uint32_t to_write = avail < bytes ? avail : bytes;
       if (to_write > 0)
       {
-         pthread_mutex_lock(&port->lock);
+	 sys_lwmutex_lock(&port->lock, SYS_NO_TIMEOUT);
          fifo_write(port->buffer, data, to_write);
-         pthread_mutex_unlock(&port->lock);
+	 sys_lwmutex_unlock(&port->lock);
          bytes -= to_write;
          data += to_write >> 1;
       }
       else
-      {
-         pthread_mutex_lock(&port->cond_lock);
-         pthread_cond_wait(&port->cond, &port->cond_lock);
-         pthread_mutex_unlock(&port->cond_lock);
-      }
+         sys_lwcond_wait(&port->cond, 0);
    }
 
    return ret;
 }
 
-static u32 audioport_alive(cell_audio_handle_t handle)
+static uint32_t audioport_alive(cell_audio_handle_t handle)
 {
    (void)handle;
    return 1;
